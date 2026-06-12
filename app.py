@@ -13,9 +13,12 @@ Run with:   streamlit run app.py
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
+import seaborn as sns
 import streamlit as st
+from scipy.optimize import minimize   # for re-estimating DCC on an asset subset
 
 # --------------------------------------------------------------------------- #
 # Page config & light styling
@@ -55,6 +58,7 @@ def load_all():
         "returns":  load("returns"),
         "cond_vol": load("cond_vol"),
         "corr":     load("corr_series"),
+        "std_resid":load("std_resid"),
         "weights":  load("mvp_weights"),
         "port":     load("portfolio_returns"),
         "desc":     load("descriptives"),
@@ -76,6 +80,61 @@ returns = D["returns"]
 ASSETS = list(returns.columns)
 PAIRS = list(D["corr"].columns)
 
+
+# --------------------------------------------------------------------------- #
+# Re-estimate DCC(1,1) on a SUBSET of assets (1–5 of the selected stocks)
+# --------------------------------------------------------------------------- #
+# The univariate GARCH step is subset-invariant, so the saved standardized
+# residuals are reused as-is — only the cheap correlation step is recomputed.
+@st.cache_data(show_spinner="Estimating DCC on selected assets…")
+def estimate_dcc(cols: tuple, lo_ts=None, hi_ts=None):
+    """DCC(1,1) on `cols` using the saved standardized residuals.
+    Returns a/b, the conditional-correlation series, and the matrices R_t.
+    Returns None when fewer than 2 assets are given (a correlation needs a pair)."""
+    sr = D["std_resid"][list(cols)].dropna()
+    if lo_ts is not None and hi_ts is not None:      # optional: estimate on a window
+        sr = sr.loc[lo_ts:hi_ts]
+    if sr.shape[1] < 2 or len(sr) < 30:
+        return None
+
+    E = sr.values
+    T, N = E.shape
+    Qbar = np.cov(E, rowvar=False)
+
+    def dcc_filter(a, b):
+        Q = Qbar.copy()
+        Rt = np.empty((T, N, N))
+        for t in range(T):
+            if t > 0:
+                e = E[t - 1][:, None]
+                Q = (1 - a - b) * Qbar + a * (e @ e.T) + b * Q
+            d = np.sqrt(np.diag(Q))
+            Rt[t] = Q / np.outer(d, d)
+        return Rt
+
+    def neg_loglik(theta):
+        a, b = theta
+        if a < 0 or b < 0 or a + b >= 0.9999:
+            return 1e10
+        Rt = dcc_filter(a, b)
+        ll = 0.0
+        for t in range(T):
+            et = E[t][:, None]
+            _, logdet = np.linalg.slogdet(Rt[t])
+            ll += logdet + (et.T @ np.linalg.solve(Rt[t], et))[0, 0] - (et.T @ et)[0, 0]
+        return 0.5 * ll
+
+    opt = minimize(neg_loglik, x0=[0.02, 0.95], method="L-BFGS-B",
+                   bounds=[(1e-6, 0.5), (1e-6, 0.999)])
+    a, b = opt.x
+    Rt = dcc_filter(a, b)
+
+    pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
+    corr = pd.DataFrame(
+        {f"{cols[i]}-{cols[j]}": Rt[:, i, j] for i, j in pairs}, index=sr.index)
+    return {"a": a, "b": b, "Rt": Rt, "corr": corr,
+            "assets": list(cols), "loglik": -opt.fun, "n_obs": T}
+
 # --------------------------------------------------------------------------- #
 # Sidebar controls (shared across tabs)
 # --------------------------------------------------------------------------- #
@@ -91,6 +150,25 @@ date_range = st.sidebar.slider(
     "Date range", min_value=dmin, max_value=dmax, value=(dmin, dmax), format="YYYY-MM"
 )
 lo, hi = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
+
+st.sidebar.divider()
+reestimate = st.sidebar.toggle(
+    "Re-estimate DCC on selected assets",
+    value=False,
+    help="Off = show the full-sample 5-asset model from the notebook. "
+         "On = re-run the DCC step on just the selected assets.",
+)
+est_on_window = st.sidebar.checkbox(
+    "Estimate on the visible date window", value=False, disabled=not reestimate,
+    help="Off = use the full sample (recommended, more stable). "
+         "On = fit α, β only on the selected window (regime-specific).",
+)
+
+# Run the subset estimation when requested (cached on the asset tuple + window).
+sub = None
+if reestimate:
+    win = (lo, hi) if est_on_window else (None, None)
+    sub = estimate_dcc(tuple(sorted(sel_assets)), *win)
 
 
 def clip(df: pd.DataFrame) -> pd.DataFrame:
@@ -109,11 +187,23 @@ st.caption("Financial Econometrics · HW5 · multivariate volatility & minimum-v
 
 a_hat = float(D["dcc"]["a"].iloc[0])
 b_hat = float(D["dcc"]["b"].iloc[0])
+
+# If re-estimating, show the subset's α/β instead of the full-sample numbers.
+if reestimate and sub is not None:
+    a_hat, b_hat = sub["a"], sub["b"]
+    src = f"{len(sub['assets'])} selected assets · {sub['n_obs']} obs"
+elif reestimate and sub is None:
+    src = "DCC needs ≥2 assets — pick more"
+else:
+    src = "full-sample model (5 assets)"
+
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("DCC α", f"{a_hat:.3f}")
-c2.metric("DCC β", f"{b_hat:.3f}")
-c3.metric("Persistence α+β", f"{a_hat + b_hat:.3f}")
-c4.metric("Assets", len(ASSETS))
+c1.metric("DCC α", f"{a_hat:.3f}" if not (reestimate and sub is None) else "—")
+c2.metric("DCC β", f"{b_hat:.3f}" if not (reestimate and sub is None) else "—")
+c3.metric("Persistence α+β",
+          f"{a_hat + b_hat:.3f}" if not (reestimate and sub is None) else "—")
+c4.metric("Model", f"{len(sel_assets)} sel." if reestimate else len(ASSETS))
+st.caption(f"Estimated on: **{src}**.")
 
 tab_ret, tab_vol, tab_corr, tab_port = st.tabs(
     ["Returns & Stats", "Conditional Volatility", "Conditional Correlations", "Portfolio"]
@@ -152,6 +242,15 @@ with tab_ret:
     figp.update_layout(height=360, legend_title_text="", margin=dict(t=10, b=0))
     st.plotly_chart(figp, use_container_width=True)
 
+    st.subheader("Bivariate scatterplots of daily returns")
+    r_pair = clip(returns)[sel_assets]
+    g = sns.pairplot(r_pair, kind="scatter", diag_kind="kde",
+                     plot_kws=dict(s=8, alpha=0.3, edgecolor="none"),
+                     corner=True, height=1.9)
+    g.figure.suptitle("Bivariate scatterplots of daily returns", y=1.02)
+    st.pyplot(g.figure, use_container_width=True)
+    plt.close(g.figure)
+
 # =========================================================================== #
 # TAB 2 — Conditional volatility (Q4)
 # =========================================================================== #
@@ -171,31 +270,45 @@ with tab_vol:
 # TAB 3 — Conditional correlations (Q5) + dynamic heatmap
 # =========================================================================== #
 with tab_corr:
+    use_sub = reestimate and sub is not None
+    src_label = ("re-estimated on selected assets" if use_sub
+                 else "full-sample 5-asset model")
     st.subheader("DCC conditional correlations  ρ$_{ij,t}$")
-    if sel_pairs:
-        cs = clip(D["corr"])[sel_pairs]
+    st.caption(f"Source: {src_label}.")
+
+    if reestimate and sub is None:
+        st.warning("Select at least 2 assets to estimate a DCC correlation.")
+
+    # choose which correlation set + pair list to plot
+    corr_src = sub["corr"] if use_sub else D["corr"]
+    pair_src = list(corr_src.columns) if use_sub else sel_pairs
+
+    if pair_src:
+        cs = clip(corr_src)[[p for p in pair_src if p in corr_src.columns]]
         fig = px.line(cs, template=TEMPLATE, color_discrete_sequence=PALETTE,
                       labels={"value": "correlation", "Date": "", "variable": "pair"})
         fig.add_hline(y=0, line_dash="dash", line_color="grey", line_width=1)
         fig.update_layout(height=460, legend_title_text="", margin=dict(t=10, b=0))
         st.plotly_chart(fig, use_container_width=True)
-    else:
+    elif not (reestimate and sub is None):
         st.warning("Select at least two assets to show a pair.")
 
     st.subheader("Correlation matrix on a chosen date")
     st.caption("Rebuilt on the fly from the pairwise series — pick any trading day.")
-    cs_full = clip(D["corr"])
-    if len(cs_full):
+    heat_assets = sub["assets"] if use_sub else ASSETS
+    cs_full = clip(corr_src)
+    if len(cs_full) and len(heat_assets) >= 2:
         day = st.select_slider("Date", options=list(cs_full.index),
                                value=cs_full.index[-1],
                                format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d"))
         # reconstruct the symmetric NxN correlation matrix for that day
-        row = D["corr"].loc[day]
-        M = pd.DataFrame(np.eye(len(ASSETS)), index=ASSETS, columns=ASSETS)
+        row = corr_src.loc[day]
+        M = pd.DataFrame(np.eye(len(heat_assets)), index=heat_assets, columns=heat_assets)
         for pair, val in row.items():
             i, j = pair.split("-")
             M.loc[i, j] = M.loc[j, i] = val
-        M = M.loc[sel_assets, sel_assets]
+        if not use_sub:
+            M = M.loc[sel_assets, sel_assets]
         heat = px.imshow(M, text_auto=".2f", color_continuous_scale="RdBu_r",
                          zmin=-1, zmax=1, aspect="auto", template=TEMPLATE)
         heat.update_layout(height=420, margin=dict(t=10, b=0),
