@@ -244,7 +244,7 @@ with tab_ret:
 
     st.subheader("Bivariate scatterplots of daily returns")
     r_pair = clip(returns)[sel_assets]
-    g = sns.pairplot(r_pair, kind="scatter", diag_kind="kde",
+    g = sns.pairplot(r_pair, kind="scatter", diag_kind=None,
                      plot_kws=dict(s=8, alpha=0.3, edgecolor="none"),
                      corner=True, height=1.9)
     g.figure.suptitle("Bivariate scatterplots of daily returns", y=1.02)
